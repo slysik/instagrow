@@ -1,0 +1,428 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============== USERS & AUTH ==============
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String?
+  image         String?
+  emailVerified DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // Relations
+  accounts     Account[]
+  sessions     Session[]
+  subscription Subscription?
+  igAccounts   InstagramAccount[]
+  promptRuns   PromptRun[]
+
+  // Settings
+  timezone           String  @default("America/New_York")
+  onboardingComplete Boolean @default(false)
+
+  @@index([email])
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ============== BILLING ==============
+
+model Subscription {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Stripe
+  stripeCustomerId     String? @unique
+  stripeSubscriptionId String? @unique
+  stripePriceId        String?
+
+  // Status
+  status             SubStatus @default(TRIALING)
+  trialEndsAt        DateTime?
+  currentPeriodStart DateTime?
+  currentPeriodEnd   DateTime?
+  cancelAtPeriodEnd  Boolean   @default(false)
+
+  // Usage quotas (reset monthly)
+  aiGenerationsUsed   Int @default(0)
+  aiGenerationsLimit  Int @default(500)
+  postsScheduledUsed  Int @default(0)
+  postsScheduledLimit Int @default(100)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([stripeCustomerId])
+  @@index([stripeSubscriptionId])
+}
+
+enum SubStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  UNPAID
+  INCOMPLETE
+}
+
+// ============== INSTAGRAM ACCOUNTS ==============
+
+model InstagramAccount {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Meta/Instagram
+  igUserId        String  @unique
+  igUsername      String
+  igName          String?
+  igProfilePic    String?
+  igFollowerCount Int?
+  igAccountType   String? // BUSINESS, CREATOR
+
+  // OAuth tokens (encrypted at rest)
+  accessToken    String    @db.Text
+  tokenExpiresAt DateTime?
+
+  // Settings
+  bestPostingTimes Json? // { mon: ["9:00", "18:00"], tue: [...] }
+  isActive         Boolean @default(true)
+
+  // Relations
+  pillars     Pillar[]
+  posts       Post[]
+  metrics     MetricSnapshot[]
+  hashtagSets HashtagSet[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([igUserId])
+}
+
+// ============== CONTENT PILLARS ==============
+
+model Pillar {
+  id        String           @id @default(cuid())
+  accountId String
+  account   InstagramAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  name        String // "Education", "Behind the Scenes", "Product"
+  description String?
+  color       String? // Hex color for UI
+  emoji       String?
+
+  // Weighting for "Make My Week"
+  weight Int @default(1) // Higher = more content from this pillar
+
+  // Relations
+  ideas Idea[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([accountId])
+}
+
+// ============== CONTENT IDEAS ==============
+
+model Idea {
+  id       String @id @default(cuid())
+  pillarId String
+  pillar   Pillar @relation(fields: [pillarId], references: [id], onDelete: Cascade)
+
+  title       String
+  description String? @db.Text
+
+  // Type
+  contentType ContentType
+
+  // Status
+  status IdeaStatus @default(DRAFT)
+
+  // Generated content
+  caption  String?  @db.Text
+  hooks    String[] // Array of hook variants
+  hashtags String[]
+  keywords String[]
+  altText  String?  @db.Text
+
+  // For Reels
+  script   Json? // { hook: "", points: [], cta: "" }
+  shotList Json? // [{ shot: 1, description: "", duration: "2s" }]
+
+  // For Carousels
+  slides Json? // [{ title: "", bullets: [] }]
+
+  // For Stories
+  frames Json? // [{ type: "poll", text: "", options: [] }]
+
+  // Scheduling
+  scheduledFor DateTime?
+  publishedAt  DateTime?
+
+  // Relations
+  posts  Post[]
+  assets Asset[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([pillarId])
+  @@index([status])
+  @@index([scheduledFor])
+}
+
+enum ContentType {
+  REEL
+  CAROUSEL
+  SINGLE_IMAGE
+  STORY
+  TEXT_POST
+}
+
+enum IdeaStatus {
+  DRAFT
+  GENERATED
+  SCHEDULED
+  PUBLISHED
+  FAILED
+  ARCHIVED
+}
+
+// ============== POSTS (Published/Scheduled) ==============
+
+model Post {
+  id        String           @id @default(cuid())
+  accountId String
+  account   InstagramAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  ideaId    String?
+  idea      Idea?            @relation(fields: [ideaId], references: [id], onDelete: SetNull)
+
+  // Instagram post data
+  igMediaId   String? @unique
+  igPermalink String?
+
+  // Content snapshot (at time of publish)
+  caption     String      @db.Text
+  hashtags    String[]
+  mediaUrls   String[]
+  contentType ContentType
+
+  // Status
+  status       PostStatus @default(DRAFT)
+  scheduledFor DateTime?
+  publishedAt  DateTime?
+  failedReason String?
+
+  // Metrics (updated periodically)
+  metrics MetricSnapshot[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([accountId])
+  @@index([status])
+  @@index([scheduledFor])
+}
+
+enum PostStatus {
+  DRAFT
+  SCHEDULED
+  PUBLISHING
+  PUBLISHED
+  FAILED
+}
+
+// ============== ASSETS (Media Files) ==============
+
+model Asset {
+  id     String @id @default(cuid())
+  ideaId String
+  idea   Idea   @relation(fields: [ideaId], references: [id], onDelete: Cascade)
+
+  // File info
+  fileName String
+  fileSize Int
+  mimeType String
+
+  // Storage
+  storageKey   String // R2 key
+  cdnUrl       String
+  thumbnailUrl String?
+
+  // Metadata
+  width    Int?
+  height   Int?
+  duration Int? // Video duration in seconds
+  altText  String?
+
+  // Order for carousels
+  order Int @default(0)
+
+  createdAt DateTime @default(now())
+
+  @@index([ideaId])
+}
+
+// ============== ANALYTICS ==============
+
+model MetricSnapshot {
+  id        String           @id @default(cuid())
+  accountId String
+  account   InstagramAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  postId    String?
+  post      Post?            @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  // Snapshot time
+  snapshotAt DateTime @default(now())
+
+  // Account-level metrics
+  followers  Int?
+  following  Int?
+  mediaCount Int?
+
+  // Post-level metrics
+  likes       Int?
+  comments    Int?
+  shares      Int?
+  saves       Int?
+  reach       Int?
+  impressions Int?
+  engagement  Float? // Calculated: (likes+comments+shares+saves)/reach
+
+  @@index([accountId])
+  @@index([postId])
+  @@index([snapshotAt])
+}
+
+// ============== AI LOGGING ==============
+
+model PromptRun {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Tool info
+  toolName String // "caption_writer", "reel_script", etc.
+
+  // Request
+  inputParams Json
+
+  // Response
+  outputData Json?
+
+  // Performance
+  model            String // "gpt-4o", "claude-3-sonnet"
+  promptTokens     Int
+  completionTokens Int
+  latencyMs        Int
+  cost             Float // USD
+
+  // Status
+  status       PromptStatus @default(PENDING)
+  errorMessage String?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([toolName])
+  @@index([createdAt])
+}
+
+enum PromptStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  CACHED
+}
+
+// ============== HASHTAG SETS (SEO Suite) ==============
+
+model HashtagSet {
+  id        String           @id @default(cuid())
+  accountId String
+  account   InstagramAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  name        String
+  description String?
+
+  // Hashtag data
+  hashtags Json // { primary: [], secondary: [], niche: [], banned: [] }
+
+  // Metadata
+  topic          String?
+  contentType    String? // "post", "reel", "carousel", "story"
+  targetAudience String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([accountId])
+}
+
+// ============== FEATURE FLAGS ==============
+
+model FeatureFlag {
+  id          String  @id @default(cuid())
+  name        String  @unique
+  description String?
+
+  // Targeting
+  enabled    Boolean  @default(false)
+  percentage Int      @default(0) // 0-100 rollout
+  userIds    String[] // Specific users
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
